@@ -19,6 +19,7 @@
 #include "matrix.h"
 #include "tinyAI.h"
 #include <array>
+#include <cstdint>
 #include <vector>
 
 #define ACT ACTIVATION::RELU
@@ -120,7 +121,7 @@ void decompress(GENERIC_TS_POOL::MemPool* p, const MatrixView<T>& x, MatrixView<
 template<typename T>
 std::size_t compress(GENERIC_TS_POOL::MemPool* p, const MatrixView<T>& x, const MatrixView<T>& y,
                          std::size_t fourier_order, std::size_t max_epochs, std::vector<int>& arch, T* bytes,
-                         T tolerance, T& error, int& status) {
+                         T tolerance, T& error, uint32_t& epochs_done, int& status, int rankId) {
    std::size_t network_size = 0;
    {
       T scale = 1.0;
@@ -150,9 +151,10 @@ std::size_t compress(GENERIC_TS_POOL::MemPool* p, const MatrixView<T>& x, const 
       tinyAI_gpuStream_t s;
       tinyAI_gpuStreamCreate(&s);
       for (std::size_t i = 0; i < max_epochs; i++) {
+         epochs_done=i;
          error = nn.train(BATCHSIZE, current_lr, s);
          if (i % 1 == 0) {
-            spdlog::info("-->Epoch [{0:d}] loss,patience=[{1:f}, {2:d}]", i, error, patience_counter);
+            spdlog::info("-->ID:{0:d} -- Epoch [{1:d}] loss,patience=[{2:f}, {3:d}]",rankId, i, error, patience_counter);
          }
          if (i > 30 && error > 0.1) {
             spdlog::critical("NETWORK RESET");
@@ -170,6 +172,7 @@ std::size_t compress(GENERIC_TS_POOL::MemPool* p, const MatrixView<T>& x, const 
          }
          if (patience_counter > patience && i > 30) {
             spdlog::info("EXIT(patience)=>Loss=[{0:f}]@({1:d})", error,i);
+            epochs_done=i;
             break;
          }
 #endif
@@ -177,6 +180,7 @@ std::size_t compress(GENERIC_TS_POOL::MemPool* p, const MatrixView<T>& x, const 
             spdlog::info("EXIT(normal)=>Loss=[{0:f}]@({1:d})", error,i);
             nn.get_weights(bytes);
             status = 1;
+            epochs_done=i;
             break;
          }
          current_lr = lr * std::exp(-0.1 * i);
@@ -187,12 +191,12 @@ std::size_t compress(GENERIC_TS_POOL::MemPool* p, const MatrixView<T>& x, const 
    return network_size;
 }
 
-
+extern "C" {
 size_t compress_phasespace6D_f32(GENERIC_TS_POOL::MemPool* p, std::size_t fin,std::size_t fout, float* coords_ptr, float* f_ptr,
                                  std::size_t size, std::size_t max_epochs, std::size_t fourier_order,
                                  size_t* hidden_layers_ptr, size_t n_hidden_layers, float sparsity, float tol,
                                  float* weights_ptr, std::size_t weight_size, bool use_input_weights,
-                                 uint32_t downsampling_factor, float& error, int& status) {
+                                 uint32_t downsampling_factor, float& error, uint32_t& epochs_done, int& status, int rankID) {
 
    TINYAI_UNUSED(use_input_weights);
    TINYAI_UNUSED(sparsity);
@@ -230,7 +234,7 @@ size_t compress_phasespace6D_f32(GENERIC_TS_POOL::MemPool* p, std::size_t fin,st
    PROFILE_END();
 
    PROFILE_START("Training Entry Point");
-   const std::size_t network_bytes_used = compress<float>(p, vcoords, vspace, fourier_order, max_epochs, arch, weights_ptr, tol, error, status);
+   const std::size_t network_bytes_used = compress<float>(p, vcoords, vspace, fourier_order, max_epochs, arch, weights_ptr, tol, error, epochs_done, status, rankID);
    PROFILE_END();
    p->destroy_with(deallocfunction);
    return network_bytes_used;
@@ -290,14 +294,122 @@ void decompress_phasespace6D_f32(GENERIC_TS_POOL::MemPool* p,std::size_t fin,std
 }
 
 
+void decompress_phasespace6D_f32_nopool(std::size_t fin,std::size_t fout, float* vcoords_ptr,
+                                float* vspace_ptr, std::size_t size, std::size_t fourier_order, size_t* hidden_layers_ptr,
+                                size_t n_hidden_layers, float* weights_ptr, std::size_t weight_size, bool use_input_weights) {
+
+   TINYAI_UNUSED(use_input_weights);
+   TINYAI_UNUSED(weight_size);
+   auto allocfunction = [&](std::size_t bytes) {
+#ifdef USE_GPU
+      void* mem;
+      tinyAI_gpuMalloc(&mem, bytes);
+#else
+      void* mem = (void*)malloc(bytes);
+#endif
+      return mem;
+   };
+
+   auto deallocfunction = [&](void* ptr) {
+#ifdef USE_GPU
+      tinyAI_gpuFree(ptr);
+#else
+      free(ptr);
+#endif
+   };
+
+   GENERIC_TS_POOL::MemPool pool=GENERIC_TS_POOL::MemPool();
+   GENERIC_TS_POOL::MemPool *p;
+   p=&pool;
+   p->init(MEMPOOL_BYTES, allocfunction);
+   std::vector<int> arch;
+   arch.reserve(n_hidden_layers + 1);
+   for (size_t i = 0; i < n_hidden_layers; ++i) {
+      arch.push_back(static_cast<int>(hidden_layers_ptr[i]));
+   }
+   arch.push_back((int)fout);
+
+   PROFILE_START("Prepare VDF");
+   MatrixView<float> vcoords = get_view_from_raw(vcoords_ptr, size, fin);
+   MatrixView<float> vspace = get_view_from_raw(vspace_ptr, size, fout);
+   PROFILE_END();
+
+   // Reconstruct
+   PROFILE_START("Training Entry Point");
+   decompress<float>(p, vcoords, vspace, fourier_order, arch, weights_ptr);
+   PROFILE_END();
+
+   PROFILE_START("Copy VDF out");
+   // Copy back
+   for (std::size_t i = 0; i < vspace.size(); ++i) {
+      vspace_ptr[i] = vspace(i);
+   }
+   PROFILE_END();
+   p->destroy_with(deallocfunction);
+   return;
+}
+
+void decompress_phasespace6D_f64_nopool(std::size_t fin,std::size_t fout, double* vcoords_ptr,
+                                double* vspace_ptr, std::size_t size, std::size_t fourier_order, size_t* hidden_layers_ptr,
+                                size_t n_hidden_layers, double* weights_ptr, std::size_t weight_size, bool use_input_weights) {
+
+   TINYAI_UNUSED(use_input_weights);
+   TINYAI_UNUSED(weight_size);
+   auto allocfunction = [&](std::size_t bytes) {
+#ifdef USE_GPU
+      void* mem;
+      tinyAI_gpuMalloc(&mem, bytes);
+#else
+      void* mem = (void*)malloc(bytes);
+#endif
+      return mem;
+   };
+
+   auto deallocfunction = [&](void* ptr) {
+#ifdef USE_GPU
+      tinyAI_gpuFree(ptr);
+#else
+      free(ptr);
+#endif
+   };
+
+   GENERIC_TS_POOL::MemPool pool=GENERIC_TS_POOL::MemPool();
+   GENERIC_TS_POOL::MemPool *p;
+   p=&pool;
+   p->init(MEMPOOL_BYTES, allocfunction);
+   std::vector<int> arch;
+   arch.reserve(n_hidden_layers + 1);
+   for (size_t i = 0; i < n_hidden_layers; ++i) {
+      arch.push_back(static_cast<int>(hidden_layers_ptr[i]));
+   }
+   arch.push_back((int)fout);
+
+   PROFILE_START("Prepare VDF");
+   MatrixView<double> vcoords = get_view_from_raw(vcoords_ptr, size, fin);
+   MatrixView<double> vspace = get_view_from_raw(vspace_ptr, size, fout);
+   PROFILE_END();
+
+   // Reconstruct
+   PROFILE_START("Training Entry Point");
+   decompress<double>(p, vcoords, vspace, fourier_order, arch, weights_ptr);
+   PROFILE_END();
+
+   PROFILE_START("Copy VDF out");
+   // Copy back
+   for (std::size_t i = 0; i < vspace.size(); ++i) {
+      vspace_ptr[i] = vspace(i);
+   }
+   PROFILE_END();
+   p->destroy_with(deallocfunction);
+   return;
+}
 
 
 size_t compress_phasespace6D_f64(GENERIC_TS_POOL::MemPool* p, std::size_t fin,std::size_t fout, double* coords_ptr, double* f_ptr,
                                  std::size_t size, std::size_t max_epochs, std::size_t fourier_order,
                                  size_t* hidden_layers_ptr, size_t n_hidden_layers, double sparsity, double tol,
                                  double* weights_ptr, std::size_t weight_size, bool use_input_weights,
-                                 uint32_t downsampling_factor, double& error, int& status) {
-
+                                 uint32_t downsampling_factor, double& error, uint32_t& epochs_done, int& status, int rankID) {
    TINYAI_UNUSED(use_input_weights);
    TINYAI_UNUSED(sparsity);
    TINYAI_UNUSED(weight_size);
@@ -334,7 +446,7 @@ size_t compress_phasespace6D_f64(GENERIC_TS_POOL::MemPool* p, std::size_t fin,st
    PROFILE_END();
 
    PROFILE_START("Training Entry Point");
-   const std::size_t network_bytes_used = compress<double>(p, vcoords, vspace, fourier_order, max_epochs, arch, weights_ptr, tol, error, status);
+   const std::size_t network_bytes_used = compress<double>(p, vcoords, vspace, fourier_order, max_epochs, arch, weights_ptr, tol, error, epochs_done ,status, rankID);
    PROFILE_END();
    p->destroy_with(deallocfunction);
    return 0;
@@ -392,3 +504,5 @@ void decompress_phasespace6D_f64(GENERIC_TS_POOL::MemPool* p,std::size_t fin,std
    p->destroy_with(deallocfunction);
    return;
 }
+}
+
