@@ -30,9 +30,11 @@ exit
 #define OUTACT ACTIVATION::NONE
 #define LF LOSSF::LOGCOSH
 #define LR 1e-4
-constexpr size_t MEMPOOL_BYTES = 60ul * 1024ul * 1024ul * 1024ul;
+#ifndef TINYAI_MEMORY_GB
+    #define TINYAI_MEMORY_GB 60
+#endif
+constexpr size_t MEMPOOL_BYTES = static_cast<size_t>(TINYAI_MEMORY_GB) * 1024ULL * 1024ULL * 1024ULL;
 constexpr size_t BATCHSIZE = 32;
-#define USE_GPU
 #ifdef USE_GPU
 constexpr auto HW = BACKEND::DEVICE;
 #else
