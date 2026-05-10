@@ -398,8 +398,12 @@ public:
          eval_samples.getView(x, i);
          eval_output.getView(y, i);
          forward(x);
-         tinyAI_gpuMemcpy(y.data(), layers.back()->a.data(), layers.back()->a.size() * sizeof(T),
-                          tinyAI_gpuMemcpyDefault);
+         if constexpr (Backend == BACKEND::HOST) {
+            std::memcpy(y.data(), layers.back()->a.data(), layers.back()->a.size() * sizeof(T));
+         } else {
+            tinyAI_gpuMemcpy(y.data(), layers.back()->a.data(), layers.back()->a.size() * sizeof(T),
+                             tinyAI_gpuMemcpyDefault);
+         }
 
          std::size_t left_over = total_samples - (i + batchSize_in_use);
          if (left_over > 0 && left_over < batchSize_in_use) {
@@ -412,8 +416,12 @@ public:
             eval_output.getView(y_last, i + batchSize_in_use);
 
             forward(x_last);
-            tinyAI_gpuMemcpy(y_last.data(), layers.back()->a.data(), layers.back()->a.size() * sizeof(T),
-                             tinyAI_gpuMemcpyDefault);
+            if constexpr (Backend == BACKEND::HOST) {
+               std::memcpy(y_last.data(), layers.back()->a.data(), layers.back()->a.size() * sizeof(T));
+            } else {
+               tinyAI_gpuMemcpy(y_last.data(), layers.back()->a.data(), layers.back()->a.size() * sizeof(T),
+                                tinyAI_gpuMemcpyDefault);
+            }
             break;
          }
       }
@@ -637,14 +645,13 @@ public:
       NumericMatrix::loss<T, LOSSFUNCTION>(layers.back()->a, target, error, &handle, stream);
       T loss = T(0.0);
       if constexpr (Backend == BACKEND::HOST) {
-         loss += NumericMatrix::matreduce_add(error, &handle);
+         loss = NumericMatrix::matreduce_add(error, &handle);
       } else {
-         loss += NumericMatrix::matreduce_add_gpu(error, _pool, &handle, stream);
+         loss = NumericMatrix::matreduce_add_gpu(error, _pool, &handle, stream);
       }
       tinyAI_gpuStreamSynchronize(stream);
-      return loss;
+      return loss / static_cast<T>(target.nrows() * target.ncols());
    }
-
    template <BACKEND HW, LOSSF LOSSFUNCTION>
    T loss(NumericMatrix::Matrix<T, HW>& error, NumericMatrix::Matrix<T, HW>& target, tinyAI_gpuStream_t stream = 0) {
       NumericMatrix::ConstMatrixView<T> target_view;
